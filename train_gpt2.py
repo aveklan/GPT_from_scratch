@@ -353,25 +353,27 @@ if ddp:
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
     nnodes = int(os.environ.get("NNODES", 1))
     
-    # For multi-node (nnodes > 1), use Gloo which is more stable
-    # For single-node multi-GPU, NCCL is faster
+    # For multi-node with Mellanox RoCE RDMA
     if nnodes > 1:
-        # For RDMA, use NCCL with UCX
         backend = "nccl"
+        
+        # Enable NCCL debug logging
         os.environ["NCCL_DEBUG"] = "INFO"
-        # Enable UCX transports for RDMA
-        os.environ["UCX_TLS"] = "rc,ud,cuda_copy"
-        os.environ["UCX_NET_IB_DEVICES"] = "mlx5_0"  # or your IB device name
+        
+        # Configure for Mellanox RoCE (RDMA over Converged Ethernet)
+        os.environ["NCCL_IB_DISABLE"] = "0"  # Disable InfiniBand/RoCE, use Socket
+        os.environ["NCCL_IB_HCA"] = "rocep2s0"  # Your Mellanox RoCE device
+        os.environ["NCCL_IB_GID_INDEX"] = "1"  # RoCE v2 - IPv4-mapped at GID 1
+        os.environ["NCCL_SOCKET_IFNAME"] = "enp2s0"  # Your RoCE interface
+        
         if ddp_rank == 0:
-            print(f"Using NCCL backend with UCX for RDMA")
+            print(f"Using NCCL backend with Mellanox RoCE RDMA")
+            print(f"  RoCE Device: rocep2s0")
+            print(f"  RoCE Interface: enp2s0")
     else:
-        backend = "nccl"  # NCCL is faster for single-node multi-GPU
+        backend = "nccl"
         if ddp_rank == 0:
             print(f"Using NCCL backend for single-node")
-    
-    # Set NCCL environment variables to disable InfiniBand if using NCCL
-    if backend == "nccl":
-        os.environ["NCCL_IB_DISABLE"] = "1"
     
     # Let torchrun handle the store/rendezvous
     init_process_group(
