@@ -3,6 +3,7 @@ import math
 import time
 import inspect
 from dataclasses import dataclass
+from datetime import timedelta
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -338,18 +339,51 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
 # set up DDP (distributed data parallel).
-# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+# For multi-node RDMA setup, use:
+# torchrun --nproc_per_node=2 --nnodes=2 --node_rank=0 --master_addr=<master_ip> --master_port=29500 train_gpt2.py
+# on node 1, and same command with --node_rank=1 on node 2
+
 ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
 if ddp:
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-    init_process_group(backend="nccl")
+    
     ddp_rank = int(os.environ["RANK"])
-    ddp_local_rank = int(os.environ["LOCAL_RANK"])
     ddp_world_size = int(os.environ["WORLD_SIZE"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    nnodes = int(os.environ.get("NNODES", 1))
+    
+    # For multi-node (nnodes > 1), use Gloo which is more stable
+    # For single-node multi-GPU, NCCL is faster
+    if nnodes > 1:
+        # For RDMA, use NCCL with UCX
+        backend = "nccl"
+        os.environ["NCCL_DEBUG"] = "INFO"
+        # Enable UCX transports for RDMA
+        os.environ["UCX_TLS"] = "rc,ud,cuda_copy"
+        os.environ["UCX_NET_IB_DEVICES"] = "mlx5_0"  # or your IB device name
+        if ddp_rank == 0:
+            print(f"Using NCCL backend with UCX for RDMA")
+    else:
+        backend = "nccl"  # NCCL is faster for single-node multi-GPU
+        if ddp_rank == 0:
+            print(f"Using NCCL backend for single-node")
+    
+    # Set NCCL environment variables to disable InfiniBand if using NCCL
+    if backend == "nccl":
+        os.environ["NCCL_IB_DISABLE"] = "1"
+    
+    # Let torchrun handle the store/rendezvous
+    init_process_group(
+        backend=backend,
+        timeout=timedelta(minutes=30)
+    )
+    
     device = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(device)
-    master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
+    master_process = ddp_rank == 0
+    if master_process:
+        print(f"DDP initialized: rank {ddp_rank}/{ddp_world_size}, local_rank {ddp_local_rank}, backend: {backend}")
 else:
     # vanilla, non-DDP run
     ddp_rank = 0
@@ -373,7 +407,8 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 524288  # 2**19, ~0.5M, in number of tokens
+# total_batch_size = 524288  # 2**19, ~0.5M, in number of tokens
+total_batch_size = 8192  # 2**19, ~0.5M, in number of tokens
 B = 4  # micro batch size
 T = 1024  # sequence length
 assert (
