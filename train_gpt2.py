@@ -8,61 +8,110 @@ import torch.nn as nn
 from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
 
-# -----------------------------------------------------------------------------
+# ============= MINIMAL TENSOR PARALLELISM ADDITIONS =============
 
+def allgather_along_dim(x, dim, world_size, rank):
+    """AllGather tensor along specified dimension"""
+    if world_size == 1:
+        return x
+    gathered = [torch.zeros_like(x) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered, x)
+    return torch.cat(gathered, dim=dim)
+
+class TPLinear(nn.Module):
+    """Column-parallel Linear layer"""
+    def __init__(self, in_features, out_features, bias=True, tp_rank=0, tp_world_size=1):
+        super().__init__()
+        assert out_features % tp_world_size == 0
+        self.tp_rank = tp_rank
+        self.tp_world_size = tp_world_size
+        self.out_features_local = out_features // tp_world_size
+        self.weight = nn.Parameter(torch.empty(self.out_features_local, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(self.out_features_local))
+        else:
+            self.register_parameter('bias', None)
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+    
+    def forward(self, x, gather=True):
+        out = F.linear(x, self.weight, self.bias)
+        if gather and self.tp_world_size > 1:
+            out = allgather_along_dim(out, dim=-1, world_size=self.tp_world_size, rank=self.tp_rank)
+        return out
+
+class TPLinearReduce(nn.Module):
+    """Row-parallel Linear layer with AllReduce"""
+    def __init__(self, in_features, out_features, bias=True, tp_rank=0, tp_world_size=1):
+        super().__init__()
+        assert in_features % tp_world_size == 0
+        self.tp_rank = tp_rank
+        self.tp_world_size = tp_world_size
+        self.in_features_local = in_features // tp_world_size
+        self.weight = nn.Parameter(torch.empty(out_features, self.in_features_local))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter('bias', None)
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+    
+    def forward(self, x):
+        x_local = x[..., self.tp_rank * self.in_features_local : (self.tp_rank + 1) * self.in_features_local]
+        out = F.linear(x_local, self.weight, self.bias)
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(out)
+        return out
+
+# ================================================================
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, tp_rank=0, tp_world_size=1):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        # Column-parallel QKV projection
+        self.c_attn = TPLinear(config.n_embd, 3 * config.n_embd, tp_rank=tp_rank, tp_world_size=tp_world_size)
+        # Row-parallel output projection
+        self.c_proj = TPLinearReduce(config.n_embd, config.n_embd, tp_rank=tp_rank, tp_world_size=tp_world_size)
         self.c_proj.NANOGPT_SCALE_INIT = 1
-        # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
     def forward(self, x):
-        B, T, C = (
-            x.size()
-        )  # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
-        # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
-        qkv = self.c_attn(x)
+        B, T, C = x.size()
+        # QKV projection with AllGather
+        qkv = self.c_attn(x, gather=True)
         q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # flash attention
-        y = (
-            y.transpose(1, 2).contiguous().view(B, T, C)
-        )  # re-assemble all head outputs side by side
-        # output projection
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        # Output projection with AllReduce
         y = self.c_proj(y)
         return y
 
 
 class MLP(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, tp_rank=0, tp_world_size=1):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+        # Column-parallel expansion
+        self.c_fc = TPLinear(config.n_embd, 4 * config.n_embd, tp_rank=tp_rank, tp_world_size=tp_world_size)
         self.gelu = nn.GELU(approximate="tanh")
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        # Row-parallel contraction
+        self.c_proj = TPLinearReduce(4 * config.n_embd, config.n_embd, tp_rank=tp_rank, tp_world_size=tp_world_size)
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
-        x = self.c_fc(x)
+        x = self.c_fc(x, gather=False)
         x = self.gelu(x)
         x = self.c_proj(x)
         return x
@@ -70,12 +119,12 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, tp_rank=0, tp_world_size=1):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, tp_rank=tp_rank, tp_world_size=tp_world_size)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, tp_rank=tp_rank, tp_world_size=tp_world_size)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -96,15 +145,17 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, tp_rank=0, tp_world_size=1):
         super().__init__()
         self.config = config
+        self.tp_rank = tp_rank
+        self.tp_world_size = tp_world_size
 
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
                 wpe=nn.Embedding(config.block_size, config.n_embd),
-                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                h=nn.ModuleList([Block(config, tp_rank=tp_rank, tp_world_size=tp_world_size) for _ in range(config.n_layer)]),
                 ln_f=nn.LayerNorm(config.n_embd),
             )
         )
@@ -326,35 +377,31 @@ def get_most_likely_row(tokens, mask, logits):
     return pred_norm
 
 
-# -----------------------------------------------------------------------------
-# simple launch:
-# python train_gpt2.py
-# DDP launch for e.g. 8 GPUs:
-# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+# ============================================================================
+# Tensor Parallelism Training
+# Usage: torchrun --nproc_per_node=1 --nnodes=2 --node_rank=0 --master_addr=192.168.1.100 train_gpt2.py
+# ============================================================================
 
-# run the training loop
 from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
-# set up DDP (distributed data parallel).
-# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
-ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
-if ddp:
-    # use of DDP atm demands CUDA, we set the device appropriately according to rank
-    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-    init_process_group(backend="nccl")
-    ddp_rank = int(os.environ["RANK"])
-    ddp_local_rank = int(os.environ["LOCAL_RANK"])
-    ddp_world_size = int(os.environ["WORLD_SIZE"])
-    device = f"cuda:{ddp_local_rank}"
+# set up Tensor Parallelism with Gloo backend (supports RDMA)
+tp = int(os.environ.get("RANK", -1)) != -1  # is this a tp run?
+if tp:
+    # use Gloo backend for RDMA support
+    assert torch.cuda.is_available(), "CUDA required for TP training"
+    init_process_group(backend="gloo")
+    tp_rank = int(os.environ["RANK"])
+    tp_local_rank = int(os.environ["LOCAL_RANK"])
+    tp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{tp_local_rank}"
     torch.cuda.set_device(device)
-    master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
+    master_process = tp_rank == 0  # this process will do logging, checkpointing etc.
 else:
-    # vanilla, non-DDP run
-    ddp_rank = 0
-    ddp_local_rank = 0
-    ddp_world_size = 1
+    # vanilla, non-TP run
+    tp_rank = 0
+    tp_local_rank = 0
+    tp_world_size = 1
     master_process = True
     # attempt to autodetect device
     device = "cpu"
@@ -367,9 +414,9 @@ else:
 # added after video, pytorch can be serious about it's device vs. device_type distinction
 device_type = "cuda" if device.startswith("cuda") else "cpu"
 
-torch.manual_seed(1337)
+torch.manual_seed(1337 + tp_rank)
 if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
+    torch.cuda.manual_seed(1337 + tp_rank)
 
 enc = tiktoken.get_encoding("gpt2")
 
@@ -377,24 +424,25 @@ total_batch_size = 524288  # 2**19, ~0.5M, in number of tokens
 B = 4  # micro batch size
 T = 1024  # sequence length
 assert (
-    total_batch_size % (B * T * ddp_world_size) == 0
-), "make sure total_batch_size is divisible by B * T * ddp_world_size"
-grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+    total_batch_size % (B * T * tp_world_size) == 0
+), "make sure total_batch_size is divisible by B * T * tp_world_size"
+grad_accum_steps = total_batch_size // (B * T * tp_world_size)
 if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    print(f"Tensor Parallel World Size: {tp_world_size}, Rank: {tp_rank}")
 
 train_loader = DataLoaderLite(
-    B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train"
+    B=B, T=T, process_rank=tp_rank, num_processes=tp_world_size, split="train"
 )
 val_loader = DataLoaderLite(
-    B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val"
+    B=B, T=T, process_rank=tp_rank, num_processes=tp_world_size, split="val"
 )
 
 torch.set_float32_matmul_precision("high")
 
-# create model
-model = GPT(GPTConfig(vocab_size=50304))
+# create model WITH TENSOR PARALLELISM PARAMETERS
+model = GPT(GPTConfig(vocab_size=50304), tp_rank=tp_rank, tp_world_size=tp_world_size)
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
 use_compile = (
@@ -402,9 +450,7 @@ use_compile = (
 )
 if use_compile:
     model = torch.compile(model)
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module if ddp else model  # always contains the "raw" unwrapped model
+raw_model = model  # no DDP wrapper needed for TP
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -460,7 +506,7 @@ for step in range(max_steps):
                     logits, loss = model(x, y)
                 loss = loss / val_loss_steps
                 val_loss_accum += loss.detach()
-        if ddp:
+        if tp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
@@ -484,8 +530,8 @@ for step in range(max_steps):
         num_correct_norm = 0
         num_total = 0
         for i, example in enumerate(iterate_examples("val")):
-            # only process examples where i % ddp_world_size == ddp_rank
-            if i % ddp_world_size != ddp_rank:
+            # only process examples where i % tp_world_size == tp_rank
+            if i % tp_world_size != tp_rank:
                 continue
             # render the example into tokens and labels
             _, tokens, mask, label = render_example(example)
@@ -499,7 +545,7 @@ for step in range(max_steps):
             num_total += 1
             num_correct_norm += int(pred_norm == label)
         # reduce the stats across all processes
-        if ddp:
+        if tp:
             num_total = torch.tensor(num_total, dtype=torch.long, device=device)
             num_correct_norm = torch.tensor(
                 num_correct_norm, dtype=torch.long, device=device
@@ -524,7 +570,7 @@ for step in range(max_steps):
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
         xgen = tokens.to(device)
         sample_rng = torch.Generator(device=device)
-        sample_rng.manual_seed(42 + ddp_rank)
+        sample_rng.manual_seed(42 + tp_rank)
         while xgen.size(1) < max_length:
             # forward the model to get the logits
             with torch.no_grad():
@@ -548,7 +594,7 @@ for step in range(max_steps):
         for i in range(num_return_sequences):
             tokens = xgen[i, :max_length].tolist()
             decoded = enc.decode(tokens)
-            print(f"rank {ddp_rank} sample {i}: {decoded}")
+            print(f"rank {tp_rank} sample {i}: {decoded}")
 
     # do one step of the optimization
     model.train()
@@ -557,9 +603,6 @@ for step in range(max_steps):
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        # added after video, this field is also used by the forward pass.
-        if ddp:
-            model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
@@ -569,7 +612,7 @@ for step in range(max_steps):
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
         loss.backward()
-    if ddp:
+    if tp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determine and set the learning rate for this iteration
@@ -582,7 +625,7 @@ for step in range(max_steps):
     t1 = time.time()
     dt = t1 - t0  # time difference in seconds
     tokens_processed = (
-        train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+        train_loader.B * train_loader.T * grad_accum_steps * tp_world_size
     )
     tokens_per_sec = tokens_processed / dt
     if master_process:
@@ -592,5 +635,5 @@ for step in range(max_steps):
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss_accum.item():.6f}\n")
 
-if ddp:
+if tp:
     destroy_process_group()
