@@ -1,6 +1,6 @@
 #!/bin/bash
 
-MASTER_ADDR="192.168.1.100"
+MASTER_ADDR="192.168.2.100"
 MASTER_PORT=29500
 NNODES=2
 NPROC_PER_NODE=1
@@ -26,7 +26,9 @@ export MASTER_ADDR=$MASTER_ADDR
 export MASTER_PORT=$MASTER_PORT
 
 # Force Gloo to use the correct interface (disable loopback binding)
-export GLOO_SOCKET_IFNAME=enp2s0  # Change to your RDMA NIC name if different
+export GLOO_SOCKET_IFNAME=enp2s0d1  # Change to your RDMA NIC name if different
+export NCCL_DEBUG=INFO
+export NCCL_ASYNC_ERROR_HANDLING=1
 
 echo "========================================"
 echo "Starting node $NODE_RANK"

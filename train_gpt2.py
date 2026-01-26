@@ -15,7 +15,11 @@ def allgather_along_dim(x, dim, world_size, rank):
     if world_size == 1:
         return x
     gathered = [torch.zeros_like(x) for _ in range(world_size)]
+    print(f"[ALLGATHER] Rank {rank}: starting all_gather for, shape={x.shape}")
+    t0 = time.time()
     torch.distributed.all_gather(gathered, x)
+    dt = time.time() - t0
+    print(f"[ALLGATHER] Rank {rank}: done all_gather for, duration={dt*1000:.2f}ms")
     return torch.cat(gathered, dim=dim)
 
 class TPLinear(nn.Module):
@@ -66,7 +70,11 @@ class TPLinearReduce(nn.Module):
         x_local = x[..., self.tp_rank * self.in_features_local : (self.tp_rank + 1) * self.in_features_local]
         out = F.linear(x_local, self.weight, self.bias)
         if self.tp_world_size > 1:
+            print(f"[ALLREDUCE]: starting all_reduce for, shape={x.shape}")
+            t0 = time.time()
             torch.distributed.all_reduce(out)
+            dt = time.time() - t0
+            print(f"[ALLREDUCE]: done all_reduce for, duration={dt*1000:.2f}ms")
         return out
 
 # ================================================================
@@ -111,7 +119,7 @@ class MLP(nn.Module):
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
-        x = self.c_fc(x, gather=False)
+        x = self.c_fc(x, gather=True)
         x = self.gelu(x)
         x = self.c_proj(x)
         return x
@@ -390,7 +398,7 @@ tp = int(os.environ.get("RANK", -1)) != -1  # is this a tp run?
 if tp:
     # use Gloo backend for RDMA support
     assert torch.cuda.is_available(), "CUDA required for TP training"
-    init_process_group(backend="gloo")
+    init_process_group(backend="nccl")
     tp_rank = int(os.environ["RANK"])
     tp_local_rank = int(os.environ["LOCAL_RANK"])
     tp_world_size = int(os.environ["WORLD_SIZE"])
@@ -420,8 +428,8 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 524288  # 2**19, ~0.5M, in number of tokens
-B = 4  # micro batch size
+total_batch_size = 32768  # 2**19, ~0.5M, in number of tokens
+B = 16  # micro batch size
 T = 1024  # sequence length
 assert (
     total_batch_size % (B * T * tp_world_size) == 0
@@ -454,7 +462,7 @@ raw_model = model  # no DDP wrapper needed for TP
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 715
+warmup_steps = 0
 max_steps = (
     19073  # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 )
@@ -601,6 +609,7 @@ for step in range(max_steps):
     optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
+        print("micro-Step: ", micro_step, "range: ", range(grad_accum_steps))
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
