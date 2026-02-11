@@ -347,25 +347,25 @@ ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
 if ddp:
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-    
+
     ddp_rank = int(os.environ["RANK"])
     ddp_world_size = int(os.environ["WORLD_SIZE"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
     nnodes = int(os.environ.get("NNODES", 1))
-    
+
     # For multi-node with Mellanox RoCE RDMA
     if nnodes > 1:
         backend = "nccl"
-        
+
         # Enable NCCL debug logging
         os.environ["NCCL_DEBUG"] = "INFO"
-        
+
         # Configure for Mellanox RoCE (RDMA over Converged Ethernet)
         os.environ["NCCL_IB_DISABLE"] = "0"  # Disable InfiniBand/RoCE, use Socket
         os.environ["NCCL_IB_HCA"] = "rocep2s0"  # Your Mellanox RoCE device
         os.environ["NCCL_IB_GID_INDEX"] = "1"  # RoCE v2 - IPv4-mapped at GID 1
         os.environ["NCCL_SOCKET_IFNAME"] = "enp2s0"  # Your RoCE interface
-        
+
         if ddp_rank == 0:
             print(f"Using NCCL backend with Mellanox RoCE RDMA")
             print(f"  RoCE Device: rocep2s0")
@@ -374,18 +374,17 @@ if ddp:
         backend = "nccl"
         if ddp_rank == 0:
             print(f"Using NCCL backend for single-node")
-    
+
     # Let torchrun handle the store/rendezvous
-    init_process_group(
-        backend=backend,
-        timeout=timedelta(minutes=30)
-    )
-    
+    init_process_group(backend=backend, timeout=timedelta(minutes=30))
+
     device = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0
     if master_process:
-        print(f"DDP initialized: rank {ddp_rank}/{ddp_world_size}, local_rank {ddp_local_rank}, backend: {backend}")
+        print(
+            f"DDP initialized: rank {ddp_rank}/{ddp_world_size}, local_rank {ddp_local_rank}, backend: {backend}"
+        )
 else:
     # vanilla, non-DDP run
     ddp_rank = 0
@@ -410,7 +409,7 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 # total_batch_size = 524288  # 2**19, ~0.5M, in number of tokens
-total_batch_size = 8192  # 2**19, ~0.5M, in number of tokens
+total_batch_size = 131072  # 2**19, ~0.5M, in number of tokens
 B = 4  # micro batch size
 T = 1024  # sequence length
 assert (
@@ -428,12 +427,14 @@ val_loader = DataLoaderLite(
     B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val"
 )
 
-torch.set_float32_matmul_precision("high")
+torch.set_float32_matmul_precision("highest")
 
 # create model
 model = GPT(GPTConfig(vocab_size=50304))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
+model = model.float()
+
 use_compile = (
     False  # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 )
@@ -493,8 +494,8 @@ for step in range(max_steps):
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
+                # with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
                 loss = loss / val_loss_steps
                 val_loss_accum += loss.detach()
         if ddp:
@@ -530,8 +531,8 @@ for step in range(max_steps):
             mask = mask.to(device)
             # get the logits
             with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(tokens)
+                # with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                logits, loss = model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
             num_correct_norm += int(pred_norm == label)
@@ -565,8 +566,8 @@ for step in range(max_steps):
         while xgen.size(1) < max_length:
             # forward the model to get the logits
             with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(xgen)  # (B, T, vocab_size)
+                # with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                logits, loss = model(xgen)  # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :]  # (B, vocab_size)
                 # get the probabilities
@@ -597,8 +598,8 @@ for step in range(max_steps):
         # added after video, this field is also used by the forward pass.
         if ddp:
             model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
+        # with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
         # addition of gradients corresponds to a SUM in the objective, but
