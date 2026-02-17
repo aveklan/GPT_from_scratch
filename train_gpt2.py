@@ -90,9 +90,9 @@ class GPTConfig:
     vocab_size: int = (
         50257  # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     )
-    n_layer: int = 12  # number of layers
-    n_head: int = 12  # number of heads
-    n_embd: int = 768  # embedding dimension
+    n_layer: int = 24  # number of layers
+    n_head: int = 16  # number of heads
+    n_embd: int = 1024  # embedding dimension
 
 
 class GPT(nn.Module):
@@ -357,19 +357,26 @@ if ddp:
     if nnodes > 1:
         backend = "nccl"
 
-        # Enable NCCL debug logging
-        os.environ["NCCL_DEBUG"] = "INFO"
+        # Respect launcher-provided NCCL config; only set safe defaults when unset.
+        os.environ.setdefault("NCCL_DEBUG", "INFO")
+        os.environ.setdefault("NCCL_IB_DISABLE", "0")
+        os.environ.setdefault("NCCL_IB_GID_INDEX", "1")
+        os.environ.setdefault("NCCL_SOCKET_IFNAME", "enp2s0")
 
-        # Configure for Mellanox RoCE (RDMA over Converged Ethernet)
-        os.environ["NCCL_IB_DISABLE"] = "0"  # Disable InfiniBand/RoCE, use Socket
-        os.environ["NCCL_IB_HCA"] = "rocep2s0"  # Your Mellanox RoCE device
-        os.environ["NCCL_IB_GID_INDEX"] = "1"  # RoCE v2 - IPv4-mapped at GID 1
-        os.environ["NCCL_SOCKET_IFNAME"] = "enp2s0"  # Your RoCE interface
+        # If HCA is not provided, auto-detect from sysfs.
+        if "NCCL_IB_HCA" not in os.environ:
+            infiniband_dir = "/sys/class/infiniband"
+            if os.path.isdir(infiniband_dir):
+                hca_devices = sorted(os.listdir(infiniband_dir))
+                if hca_devices:
+                    os.environ["NCCL_IB_HCA"] = f"{hca_devices[0]}:1"
+        elif ":" not in os.environ["NCCL_IB_HCA"]:
+            os.environ["NCCL_IB_HCA"] = f"{os.environ['NCCL_IB_HCA']}:1"
 
         if ddp_rank == 0:
             print(f"Using NCCL backend with Mellanox RoCE RDMA")
-            print(f"  RoCE Device: rocep2s0")
-            print(f"  RoCE Interface: enp2s0")
+            print(f"  RoCE Device: {os.environ.get('NCCL_IB_HCA', 'unset')}")
+            print(f"  RoCE Interface: {os.environ.get('NCCL_SOCKET_IFNAME', 'unset')}")
     else:
         backend = "nccl"
         if ddp_rank == 0:
@@ -409,8 +416,8 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 # total_batch_size = 524288  # 2**19, ~0.5M, in number of tokens
-total_batch_size = 131072  # 2**19, ~0.5M, in number of tokens
-B = 4  # micro batch size
+total_batch_size = 4096  # 2**19, ~0.5M, in number of tokens
+B = 1  # micro batch size
 T = 1024  # sequence length
 assert (
     total_batch_size % (B * T * ddp_world_size) == 0
