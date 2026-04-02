@@ -416,7 +416,7 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 # total_batch_size = 524288  # 2**19, ~0.5M, in number of tokens
-total_batch_size = 4096  # 2**19, ~0.5M, in number of tokens
+total_batch_size = 143360  # 2**19, ~0.5M, in number of tokens
 B = 1  # micro batch size
 T = 1024  # sequence length
 assert (

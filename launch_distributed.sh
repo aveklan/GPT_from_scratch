@@ -1,8 +1,8 @@
 #!/bin/bash
 
-MASTER_ADDR="192.168.2.100"
+MASTER_ADDR="192.168.2.1"
 MASTER_PORT=29500
-NNODES=2
+NNODES=7
 NPROC_PER_NODE=1
 
 if [ -z "$1" ]; then
@@ -32,6 +32,7 @@ export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-enp2s0}
 export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp2s0}
 export NCCL_IB_DISABLE=0
 export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,GRAPH,NET
 
 # Resolve HCA+port for the selected socket interface (e.g., rocep3s0:1 for enp2s0)
 detected_hca_port=""
