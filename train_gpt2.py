@@ -350,11 +350,12 @@ def load_tokens(filename):
 
 
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes, split):
+    def __init__(self, B, T, process_rank, num_processes, split, vocab_size=None):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        self.vocab_size = vocab_size
         assert split in {"train", "val"}
 
         # get the shard filenames
@@ -380,6 +381,9 @@ class DataLoaderLite:
         buf = self.tokens[self.current_position : self.current_position + B * T + 1]
         x = (buf[:-1]).view(B, T)  # inputs
         y = (buf[1:]).view(B, T)  # targets
+        if self.vocab_size is not None:
+            x = x.remainder(self.vocab_size)
+            y = y.remainder(self.vocab_size)
         # advance the position in the tensor
         self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds, advance to next shard
@@ -507,8 +511,22 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 8192  # 2**19, ~0.5M, in number of tokens
-B = 8  # micro batch size
+full_vocab_size = 50304
+study_vocab_size = int(os.environ.get("STUDY_VOCAB_SIZE", "0"))
+if study_vocab_size > 0:
+    if study_vocab_size < 2 or study_vocab_size > full_vocab_size:
+        raise ValueError(
+            f"STUDY_VOCAB_SIZE must be in [2, {full_vocab_size}], got {study_vocab_size}"
+        )
+    model_vocab_size = study_vocab_size
+else:
+    model_vocab_size = full_vocab_size
+
+if master_process:
+    print(f"model vocab size: {model_vocab_size}")
+
+total_batch_size = 32768  # 2**19, ~0.5M, in number of tokens
+B = 32  # micro batch size
 T = 1024  # sequence length
 data_parallel_world_size = ddp_world_size if ddp else 1
 assert (
@@ -523,29 +541,48 @@ if pipeline_parallel:
     # In naive pipeline mode, data is not sharded across stages.
     # First stage reads x, last stage reads y, both from the same sequence.
     if pp_is_first or pp_is_last:
-        train_loader = DataLoaderLite(B=B, T=T, process_rank=0, num_processes=1, split="train")
+        train_loader = DataLoaderLite(
+            B=B,
+            T=T,
+            process_rank=0,
+            num_processes=1,
+            split="train",
+            vocab_size=model_vocab_size,
+        )
     else:
         train_loader = None
 else:
     train_loader = DataLoaderLite(
-        B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train"
+        B=B,
+        T=T,
+        process_rank=ddp_rank,
+        num_processes=ddp_world_size,
+        split="train",
+        vocab_size=model_vocab_size,
     )
     val_loader = DataLoaderLite(
-        B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val"
+        B=B,
+        T=T,
+        process_rank=ddp_rank,
+        num_processes=ddp_world_size,
+        split="val",
+        vocab_size=model_vocab_size,
     )
 
 torch.set_float32_matmul_precision("high")
 
 # create model
 if pipeline_parallel:
-    model = PipelineStageModel(GPTConfig(vocab_size=50304), pp_rank, pp_world_size)
+    model = PipelineStageModel(
+        GPTConfig(vocab_size=model_vocab_size), pp_rank, pp_world_size
+    )
     model.to(device)
     if pp_rank == 0:
         for stage in range(pp_world_size):
             s, e = get_pipeline_layer_range(model.config.n_layer, stage, pp_world_size)
             print(f"pipeline stage {stage}: transformer blocks [{s}, {e})")
 else:
-    model = GPT(GPTConfig(vocab_size=50304))
+    model = GPT(GPTConfig(vocab_size=model_vocab_size))
     # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
     model.to(device)
     use_compile = (

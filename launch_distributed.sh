@@ -26,6 +26,7 @@ export NNODES=$NNODES
 export MASTER_ADDR=$MASTER_ADDR
 export MASTER_PORT=$MASTER_PORT
 export PRINT_COLLECTIVE_TRAFFIC=${PRINT_COLLECTIVE_TRAFFIC:-1}
+export STUDY_VOCAB_SIZE=${STUDY_VOCAB_SIZE:-8192}
 
 # Force Gloo to use the correct interface (disable loopback binding)
 # export GLOO_SOCKET_IFNAME=enp2s0  # Change to your RDMA NIC name if different
@@ -59,6 +60,7 @@ echo "Starting node $NODE_RANK"
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
 echo "World Size: $WORLD_SIZE"
 echo "Mode: $MODE"
+echo "STUDY_VOCAB_SIZE: $STUDY_VOCAB_SIZE"
 echo "GLOO_SOCKET_IFNAME: $GLOO_SOCKET_IFNAME"
 echo "NCCL_SOCKET_IFNAME: $NCCL_SOCKET_IFNAME"
 echo "NCCL_IB_HCA: $NCCL_IB_HCA"
