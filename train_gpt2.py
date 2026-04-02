@@ -90,7 +90,7 @@ class GPTConfig:
     vocab_size: int = (
         50257  # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     )
-    n_layer: int = 12  # number of layers
+    n_layer: int = 28  # number of layers
     n_head: int = 12  # number of heads
     n_embd: int = 768  # embedding dimension
 
@@ -467,6 +467,14 @@ if pipeline_parallel:
 
     if pp_rank == 0:
         print(f"pipeline parallel enabled: stages={pp_world_size}, backend={backend}")
+
+    # Optional health logs to identify which stage is blocked on send/recv.
+    pp_health_log = os.environ.get("PIPELINE_HEALTH_LOG", "0") == "1"
+    pp_health_every = int(os.environ.get("PIPELINE_HEALTH_EVERY", "10"))
+
+    def pipeline_log(step, msg):
+        if pp_health_log and (step % pp_health_every == 0):
+            print(f"[pipeline][rank={pp_rank}][step={step}] {msg}", flush=True)
 else:
     ddp = distributed
     if ddp:
@@ -499,7 +507,7 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 65536  # 2**19, ~0.5M, in number of tokens
+total_batch_size = 8192  # 2**19, ~0.5M, in number of tokens
 B = 8  # micro batch size
 T = 1024  # sequence length
 data_parallel_world_size = ddp_world_size if ddp else 1
@@ -604,20 +612,27 @@ if pipeline_parallel:
 
         for _ in range(grad_accum_steps):
             if pp_is_first:
+                pipeline_log(step, "first: loading batch")
                 x, _ = train_loader.next_batch()
                 x = x.to(device)
                 h = model.forward_stage(x)
+                pipeline_log(step, f"first: send activations to rank {pp_next_rank}")
                 dist.send(h.detach(), dst=pp_next_rank)
 
                 grad_h = torch.empty_like(h)
+                pipeline_log(step, f"first: waiting grad from rank {pp_next_rank}")
                 dist.recv(grad_h, src=pp_next_rank)
+                pipeline_log(step, "first: got grad, backward")
                 h.backward(grad_h)
             elif pp_is_last:
+                pipeline_log(step, "last: loading targets")
                 _, y = train_loader.next_batch()
                 y = y.to(device)
 
                 h_in = torch.empty((B, T, model.config.n_embd), device=device)
+                pipeline_log(step, f"last: waiting activations from rank {pp_prev_rank}")
                 dist.recv(h_in, src=pp_prev_rank)
+                pipeline_log(step, "last: got activations, forward+loss")
                 h_in.requires_grad_(True)
 
                 logits, loss = model.forward_stage(h_in, y)
@@ -627,17 +642,22 @@ if pipeline_parallel:
                 loss_accum += loss.detach()
                 loss.backward()
 
+                pipeline_log(step, f"last: send grad to rank {pp_prev_rank}")
                 dist.send(h_in.grad, dst=pp_prev_rank)
             else:
                 h_in = torch.empty((B, T, model.config.n_embd), device=device)
+                pipeline_log(step, f"mid: waiting activations from rank {pp_prev_rank}")
                 dist.recv(h_in, src=pp_prev_rank)
+                pipeline_log(step, f"mid: got activations, forwarding to rank {pp_next_rank}")
                 h_in.requires_grad_(True)
 
                 h_out = model.forward_stage(h_in)
                 dist.send(h_out.detach(), dst=pp_next_rank)
 
                 grad_h_out = torch.empty_like(h_out)
+                pipeline_log(step, f"mid: waiting grad from rank {pp_next_rank}")
                 dist.recv(grad_h_out, src=pp_next_rank)
+                pipeline_log(step, f"mid: got grad, send grad to rank {pp_prev_rank}")
                 h_out.backward(grad_h_out)
                 dist.send(h_in.grad, dst=pp_prev_rank)
 
