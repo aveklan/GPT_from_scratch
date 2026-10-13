@@ -1,53 +1,46 @@
 #!/bin/bash
+set -euo pipefail
 
-MASTER_ADDR="192.168.2.100"
-MASTER_PORT=29500
-NNODES=2
-NPROC_PER_NODE=1
+# Override these through the environment when running on another cluster.
+MASTER_ADDR=${MASTER_ADDR:-192.168.2.1}
+MASTER_PORT=${MASTER_PORT:-29500}
+NNODES=${NNODES:-2}
+NPROC_PER_NODE=${NPROC_PER_NODE:-1}
 
-if [ -z "$1" ]; then
-    echo "Usage: $0 <node_rank>"
-    echo "Example: $0 0  (for master node)"
-    echo "Example: $0 1  (for worker node)"
+if [[ $# -lt 1 || ! $1 =~ ^[0-9]+$ ]]; then
+    echo "Usage: $0 <node_rank> [train_gpt2.py options]"
+    exit 1
+fi
+NODE_RANK=$1
+shift
+if (( NODE_RANK >= NNODES )); then
+    echo "node_rank must be smaller than NNODES"
     exit 1
 fi
 
-NODE_RANK=$1
-WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
+export NNODES MASTER_ADDR MASTER_PORT
+export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp2s0}
+export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-enp2s0}
+export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}
+export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
 
-# Verify master address is reachable
-echo "Checking if master address is reachable: $MASTER_ADDR"
-if ! ping -c 1 "$MASTER_ADDR" &> /dev/null; then
-    echo "WARNING: Cannot ping $MASTER_ADDR"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [[ -z ${PYTHON:-} ]]; then
+    if [[ -x "$SCRIPT_DIR/gpt/bin/python" ]]; then
+        PYTHON="$SCRIPT_DIR/gpt/bin/python"
+    else
+        PYTHON=python3
+    fi
 fi
+cd "$SCRIPT_DIR"
+echo "Starting TP node $NODE_RANK/$NNODES, $NPROC_PER_NODE GPU(s) per node"
+echo "Master: $MASTER_ADDR:$MASTER_PORT; NCCL interface: $NCCL_SOCKET_IFNAME"
 
-export NNODES=$NNODES
-export MASTER_ADDR=$MASTER_ADDR
-export MASTER_PORT=$MASTER_PORT
-
-# Force Gloo to use the correct interface (disable loopback binding)
-export GLOO_SOCKET_IFNAME=enp2s0d1  # Change to your RDMA NIC name if different
-export NCCL_DEBUG=INFO
-export NCCL_ASYNC_ERROR_HANDLING=1
-
-echo "========================================"
-echo "Starting node $NODE_RANK"
-echo "Master: $MASTER_ADDR:$MASTER_PORT"
-echo "World Size: $WORLD_SIZE"
-echo "GLOO_SOCKET_IFNAME: $GLOO_SOCKET_IFNAME"
-echo "========================================"
-
-# Kill any existing processes on this port (master node only)
-if [ "$NODE_RANK" -eq 0 ]; then
-    echo "Cleaning up port $MASTER_PORT..."
-    lsof -i :$MASTER_PORT | grep -v COMMAND | awk '{print $2}' | xargs kill -9 2>/dev/null || true
-    sleep 2
-fi
-
-torchrun \
-    --nproc_per_node=$NPROC_PER_NODE \
-    --nnodes=$NNODES \
-    --node_rank=$NODE_RANK \
-    --master_addr=$MASTER_ADDR \
-    --master_port=$MASTER_PORT \
-    train_gpt2.py
+exec "$PYTHON" -m torch.distributed.run \
+    --nproc_per_node="$NPROC_PER_NODE" \
+    --nnodes="$NNODES" \
+    --node_rank="$NODE_RANK" \
+    --master_addr="$MASTER_ADDR" \
+    --master_port="$MASTER_PORT" \
+    train_gpt2.py "$@"
