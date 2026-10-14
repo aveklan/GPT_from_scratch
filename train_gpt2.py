@@ -9,7 +9,7 @@ import torch.distributed as dist
 from torch.nn import functional as F
 
 from tensor_parallel import (
-    TPLinear, TPLinearReduce, VocabParallelEmbedding, shard_tensor,
+    TPLinear, TPLinearReduce, VocabParallelEmbedding, shard_tensor, partition_sizes,
     vocab_parallel_cross_entropy, gather_logits, clip_grad_norm_tp,
     full_state_dict, load_full_state_dict,
 )
@@ -20,15 +20,15 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config, tp_rank=0, tp_world_size=1):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        if config.n_head % tp_world_size:
-            raise ValueError("Attention heads must divide evenly across TP ranks")
+        local_heads = partition_sizes(config.n_head, tp_world_size)[tp_rank]
+        head_size = config.n_embd // config.n_head
         # Column-parallel QKV projection
-        self.c_attn = TPLinear(config.n_embd, 3 * config.n_embd, tp_rank=tp_rank, tp_world_size=tp_world_size, stride=3)
+        self.c_attn = TPLinear(config.n_embd, 3 * config.n_embd, tp_rank=tp_rank, tp_world_size=tp_world_size, stride=3, partition_unit=head_size)
         # Row-parallel output projection
-        self.c_proj = TPLinearReduce(config.n_embd, config.n_embd, tp_rank=tp_rank, tp_world_size=tp_world_size)
+        self.c_proj = TPLinearReduce(config.n_embd, config.n_embd, tp_rank=tp_rank, tp_world_size=tp_world_size, partition_unit=head_size)
         self.c_proj.NANOGPT_SCALE_INIT = 1
-        self.n_head = config.n_head // tp_world_size
-        self.n_embd = config.n_embd // tp_world_size
+        self.n_head = local_heads
+        self.n_embd = local_heads * head_size
         self.head_size = config.n_embd // config.n_head
 
     def forward(self, x):
@@ -132,7 +132,7 @@ class GPT(nn.Module):
             torch.nn.init.normal_(full, mean=0.0, std=std)
             with torch.no_grad():
                 module.weight.copy_(shard_tensor(full, module.weight.tp_dim,
-                    self.tp_rank, self.tp_world_size, module.stride))
+                    self.tp_rank, self.tp_world_size, module.stride, module.weight.tp_unit))
             if getattr(module, "bias", None) is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Linear):

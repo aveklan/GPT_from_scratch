@@ -66,7 +66,7 @@ def compare_parameters(parallel, dense, gradients=False):
             expected = F.pad(expected, (0, 0, 0, padding))
         expected = shard_tensor(expected, getattr(parameter, "tp_dim", None),
                                 parallel.tp_rank, parallel.tp_world_size,
-                                getattr(parameter, "tp_stride", 1))
+                                getattr(parameter, "tp_stride", 1), getattr(parameter, "tp_unit", 1))
         torch.testing.assert_close(actual, expected, atol=2e-9, rtol=2e-7,
                                    msg=lambda message: f"{name}: {message}")
 
@@ -76,9 +76,9 @@ def distributed_worker(rank, world_size, rendezvous):
     dist.init_process_group("gloo", init_method=f"file://{rendezvous}",
                             rank=rank, world_size=world_size)
     try:
-        for vocab_size in (36, 37):
+        for vocab_size, n_head, n_embd in ((36, 6, 24), (37, 6, 24), (36, 16, 32), (37, 16, 32)):
             config = GPTConfig(block_size=8, vocab_size=vocab_size, n_layer=2,
-                               n_head=6, n_embd=24)
+                               n_head=n_head, n_embd=n_embd)
             torch.manual_seed(17)
             base = GPT(config)
             torch.manual_seed(17)

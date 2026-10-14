@@ -58,37 +58,51 @@ class _Gather(torch.autograd.Function):
         return grad.chunk(ctx.world_size, dim=-1)[ctx.rank].contiguous(), None, None
 
 
-def shard_tensor(tensor, dim, rank, world_size, stride=1):
-    """Stride 3 partitions Q, K and V separately, preserving local [Q, K, V]."""
+def partition_sizes(features, world_size, unit=1):
+    """Balanced contiguous shards, preserving whole attention heads when unit>1."""
+    if unit < 1 or features % unit or features // unit < world_size:
+        raise ValueError("Each TP rank must receive at least one complete partition unit")
+    quotient, remainder = divmod(features // unit, world_size)
+    return [(quotient + (rank < remainder)) * unit for rank in range(world_size)]
+
+
+def shard_tensor(tensor, dim, rank, world_size, stride=1, unit=1):
+    """Partition Q/K/V independently, keeping all channels of each head together."""
     if dim is None:
         return tensor
+    if tensor.size(dim) % stride:
+        raise ValueError("Tensor dimension must be divisible by partition stride")
+    sizes = partition_sizes(tensor.size(dim) // stride, world_size, unit)
     return torch.cat(
-        [part.chunk(world_size, dim=dim)[rank]
+        [part.split(sizes, dim=dim)[rank]
          for part in tensor.chunk(stride, dim=dim)], dim=dim
     ).contiguous()
 
 
-def mark_sharded(parameter, dim, stride=1):
+def mark_sharded(parameter, dim, stride=1, unit=1, global_size=None):
     parameter.tp_dim = dim
     parameter.tp_stride = stride
+    parameter.tp_unit = unit
+    parameter.tp_global_size = global_size
 
 
 class TPLinear(nn.Module):
     """Column parallel: shard output features; keep its output local."""
 
     def __init__(self, in_features, out_features, bias=True, tp_rank=0,
-                 tp_world_size=1, stride=1):
+                 tp_world_size=1, stride=1, partition_unit=1):
         super().__init__()
-        if out_features % (tp_world_size * stride):
-            raise ValueError("Output features must divide evenly across TP ranks and QKV groups")
+        if out_features % stride:
+            raise ValueError("Output features must be divisible by the QKV stride")
+        local_features = partition_sizes(out_features // stride, tp_world_size, partition_unit)[tp_rank] * stride
         self.tp_rank, self.tp_world_size = tp_rank, tp_world_size
         self.full_shape = (out_features, in_features)
         self.stride = stride
-        self.weight = nn.Parameter(torch.empty(out_features // tp_world_size, in_features))
-        self.bias = nn.Parameter(torch.zeros(out_features // tp_world_size)) if bias else None
-        mark_sharded(self.weight, 0, stride)
+        self.weight = nn.Parameter(torch.empty(local_features, in_features))
+        self.bias = nn.Parameter(torch.zeros(local_features)) if bias else None
+        mark_sharded(self.weight, 0, stride, partition_unit, out_features)
         if bias:
-            mark_sharded(self.bias, 0, stride)
+            mark_sharded(self.bias, 0, stride, partition_unit, out_features)
 
     def forward(self, x):
         return F.linear(_Copy.apply(x, self.tp_world_size), self.weight, self.bias)
@@ -97,16 +111,15 @@ class TPLinear(nn.Module):
 class TPLinearReduce(nn.Module):
     """Row parallel: consume local input features, sum outputs, then add bias."""
 
-    def __init__(self, in_features, out_features, bias=True, tp_rank=0, tp_world_size=1):
+    def __init__(self, in_features, out_features, bias=True, tp_rank=0, tp_world_size=1, partition_unit=1):
         super().__init__()
-        if in_features % tp_world_size:
-            raise ValueError("Input features must divide evenly across TP ranks")
+        local_features = partition_sizes(in_features, tp_world_size, partition_unit)[tp_rank]
         self.tp_rank, self.tp_world_size = tp_rank, tp_world_size
         self.full_shape = (out_features, in_features)
         self.stride = 1
-        self.weight = nn.Parameter(torch.empty(out_features, in_features // tp_world_size))
+        self.weight = nn.Parameter(torch.empty(out_features, local_features))
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
-        mark_sharded(self.weight, 1)
+        mark_sharded(self.weight, 1, unit=partition_unit, global_size=in_features)
 
     def forward(self, x):
         out = _Reduce.apply(F.linear(x, self.weight), self.tp_world_size)
@@ -122,7 +135,7 @@ class VocabParallelEmbedding(nn.Module):
         self.full_shape = (self.local_size * tp_world_size, n_embd)
         self.stride = 1
         self.weight = nn.Parameter(torch.empty(self.local_size, n_embd))
-        mark_sharded(self.weight, 0)
+        mark_sharded(self.weight, 0, global_size=self.full_shape[0])
 
     def forward(self, tokens):
         outside = (tokens < self.start) | (tokens >= self.start + self.local_size)
@@ -199,9 +212,17 @@ def full_state_dict(model):
         value = p.detach()
         dim = getattr(p, "tp_dim", None)
         if dim is not None and model.tp_world_size > 1:
-            parts = [torch.empty_like(value) for _ in range(model.tp_world_size)]
-            dist.all_gather(parts, value.contiguous())
             stride = p.tp_stride
+            sizes = [n * stride for n in partition_sizes(
+                p.tp_global_size // stride, model.tp_world_size, p.tp_unit)]
+            # Collectives require equal buffers; padding is only for checkpoint I/O.
+            shape = list(value.shape)
+            shape[dim] = max(sizes)
+            padded = value.new_zeros(shape)
+            padded.narrow(dim, 0, value.size(dim)).copy_(value)
+            parts = [torch.empty_like(padded) for _ in range(model.tp_world_size)]
+            dist.all_gather(parts, padded)
+            parts = [part.narrow(dim, 0, size) for part, size in zip(parts, sizes)]
             split = [part.chunk(stride, dim=dim) for part in parts]
             value = torch.cat([split[r][s] for s in range(stride)
                                for r in range(model.tp_world_size)], dim=dim)
@@ -228,7 +249,7 @@ def load_full_state_dict(model, state):
                 value = F.pad(value, (0, 0, 0, padding))
         dim = getattr(p, "tp_dim", None)
         value = shard_tensor(value, dim, model.tp_rank, model.tp_world_size,
-                             getattr(p, "tp_stride", 1))
+                             getattr(p, "tp_stride", 1), getattr(p, "tp_unit", 1))
         if value.shape != p.shape:
             raise ValueError(f"Shape mismatch for {name}: {value.shape} != {p.shape}")
         p.copy_(value)

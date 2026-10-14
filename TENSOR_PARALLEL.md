@@ -27,7 +27,11 @@ are retained; this does not reproduce the paper's entire training recipe.
   clipping counts replicas and tied parameters once.
 
 One default process group represents **one model**, not multiple data-parallel
-replicas. Head count must be divisible by TP world size. All ranks must execute
+replicas. Whole attention heads are distributed as evenly as possible across
+ranks; the head count must be at least the TP world size. For the 355M model
+on three ranks, the 16 heads split 6/5/5, and the 4096 MLP features split
+1366/1365/1365. This preserves the model but introduces workload imbalance.
+All ranks must execute
 the same forward/backward calls. Rank 0 reads and broadcasts training/validation
 batches; all ranks evaluate the same HellaSwag examples. Sampling broadcasts
 rank 0's chosen tokens, and only rank 0 prints them.
@@ -113,7 +117,8 @@ gpt/bin/python -m unittest -v test_tensor_parallel
 ```
 
 The tests use an independent dense `nn.Linear`/`nn.Embedding` reference, two and
-three CPU/Gloo processes, divisible and uneven vocabularies, nonzero biases,
+three CPU/Gloo processes, divisible and uneven vocabularies, uneven attention
+heads and MLP partitions, nonzero biases,
 gradient accumulation, clipping, multiple AdamW steps, checkpoint round trips,
 extreme-logit cross-entropy, and collective counts. They run the real training,
 validation, evaluation, and sampling paths with small local fixtures. A separate
